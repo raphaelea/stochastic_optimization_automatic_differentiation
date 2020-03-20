@@ -1,0 +1,993 @@
+---
+title: "SOADML"
+author: "Adjerad"
+date: ""
+output: 
+  html_document:
+    css: style.css
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Project of Stochastic Optimization and Automatic Differentiation in Machine Learning
+
+
+In the following code we will reproduce the article of R. Gower, N. Le Roux and F. Bach on *Tracking the gradients using the Hessian:
+A new look at variance reducing stochastic methods*. 
+
+```{r, echo = FALSE, results='hide', message = FALSE, warning=FALSE}
+# Project Stochastic Optimization and Differentiation in Machine Learning ------
+
+# Adjerad Raphaele 
+
+setwd("~/2018-05-05 Test Raph")
+# library ----------------------------------------------------------------------
+library(ggplot2)
+library(kableExtra)
+library(knitr)
+library(matrixcalc)
+library(corpcor)
+library(xtable)
+library(expm)
+library(readr)
+library(readxl)
+library(e1071)
+library(MLmetrics)
+library(Matrix)
+```
+
+We write the main functions needed to compute the various algorithms. 
+
+```{r, warning = FALSE, message = FALSE}
+# We will show the results of the various intermediary functions for the dataset mushromms
+mushrooms <- read.matrix.csr(file = "mushrooms.txt")
+y <- mushrooms[["y"]]
+length(y)
+x <- mushrooms[["x"]]
+
+x <- as.matrix(x)
+y <- as.numeric(y)
+
+
+y[y == 1 ] <- -1
+y[y == 2] <- 1
+
+b <- as.numeric(y)
+A <- x
+N <- length(b)
+d <- ncol(A)
+A <- matrix(A, nrow = N, ncol = d)
+max_iter <- 20 #datapasses
+norm_x <- apply(A,1, function(i) norm(as.matrix(i),type = "F"))
+# Regularization parameter chosen in all experiments
+lambda <- max(norm_x)/(4*N)
+L <-   max(norm_x) + lambda
+```
+
+
+First, we define the loss. As in the article, we choose the logistic loss with a L2 regularization, i.e. (in the course notation this would amount to choosing $\Psi= ||.||_2^2$):
+$$
+loss(b,A\theta) =\frac{1}{N}\sum_{i=1}^N\log(1+\exp(-b_i(A\theta)_i)+\lambda||\theta||_2^2 
+$$
+```{r}
+# logistic loss
+# Definition of the loss F(theta) in the article
+  # for the datasets, it is a logistic loss with a penalty term 
+loss <- function(theta){
+  l <- 1/(N)*sum(log(1+ exp(-b*A%*%theta))) + lambda*norm(as.matrix(theta), type = "F")  # sum of N functions 
+  return(l)
+}
+
+loss(rep(2,d))
+loss(rep(0,d))
+```
+
+We also define the partial loss that is, in the paper the write the function to minimize as: 
+$$
+F(\theta) = \frac{1}{N}\sum_{i=1}^Nf_i(\theta)
+$$
+Well, here we have:
+$$
+F(\theta) = loss(y,A\theta)\\
+f_i(\theta) = \log(1+\exp(-b_i(A\theta)_i)+\lambda||\theta||_2^2 
+$$
+Note that if you sum the partial losses by rows and divide by $N$, you get the total loss.
+```{r}
+partial_loss <- function(theta,i){
+  l <- 1/N*(log(1+ exp(-b[i]*(A[i,]%*%theta)))) + 1/N*lambda*norm(as.matrix(theta), type = "F")  # loss of the ith argument
+  return(l)
+}
+# test
+loss(rep(3,d))
+partial_loss(rep(3,d),1)
+sum_losses <- sapply(1:N, function(i) partial_loss(rep(3,d),i))
+sum(sum_losses)
+```
+
+Then we define the partial gradient, the partial gradient is the gradient of $f_i(\theta)$. It has the same size as the gradient of $F(\theta)$ but it only uses the information of the $i^{th}$ sample. We computed what the gradient was in the pdf file joined to this code. We also define below the gradient. 
+
+```{r}
+# Partial gradient : partial with regards to line not underlying var
+partial_grad <- function(theta,i){
+  partial_g <- vector("numeric",d)
+  partial_g <-1/N*((-b[i]*A[i,])*c(1/(1+exp(b[i]*(A[i,]%*%theta))))+2*lambda*theta)
+  return(as.matrix(partial_g))
+}
+# test 
+head(partial_grad(rep(3,d),1))
+# Definition of the gradient
+grad <- function(theta){
+  sum_grad <- matrix(unlist(lapply(1:N, function(i) partial_grad(theta,i))), nrow =d)
+  sum_grads <- rowSums(sum_grad)
+  return(as.matrix(sum_grads))
+}
+# test 
+head(grad(rep(3,d)))
+ # size d
+```
+
+## Definition of the algorithms
+
+We define all the algorithms used in the paper, ie. SVRG, SVRG2, 2D, 2Dsec, CMgauss, CMprev, AMgauss and AMprev. 
+```{r}
+
+# SVRG algorithm -------------------------------------------------------------------
+SVRG_algo <- function(theta_0, gamma, max_iter = 20, seed = 123){
+  # Initialization
+  t1 <- Sys.time()
+  theta_k <- theta_0
+  theta_tilde <- theta_k
+  cost_hist <- vector("list", max_iter+1 )
+  cost_hist[[1]] <- loss(theta_0)/loss(theta_0)
+  grad_0 <- grad(theta_0)
+  grad_hist <- vector("list", max_iter +1)
+  grad_hist[[1]] <- norm(grad_0, type = 'F')
+  grad_avg <- grad_0 # average means average over N samples (total grad)
+  # main loop
+  set.seed(seed)
+  for (i in 1:(N*max_iter)){
+    # keep grad history every epoch and compute grad of theta_tilde updated
+    if (i%%N == 0){ # remainder in euclidean division of iteration by number of samples
+      print(i%/%N)
+      theta_tilde <- theta_k
+      grad_avg <- grad(theta_tilde) # calculate all gradient for theta_tilde
+      grad_hist[[i%/%N+1]] <- norm(grad_avg, type = "F") 
+      cost_hist[[i%/%N+1]] <- loss(theta_tilde)/loss(theta_0)
+    }
+    # pick random sample uniformly on [1,N]
+    idx <- sample(1:N,1)
+    current_grad <- partial_grad(theta_k,idx)
+    prev_grad <- partial_grad(theta_tilde, idx)
+    svrg_update <- current_grad - prev_grad + grad_avg 
+    theta_k <- theta_k - gamma*svrg_update
+  }
+  t2 <- Sys.time()
+  comput_time <- t2 - t1
+  return(list(theta_K = theta_k, grad_hist =grad_hist, cost_hist = cost_hist,
+              comput_time = comput_time))
+}
+```
+In order to apply SVRG2, we need to define the Hessian and the partial Hessian (once again partial means that it is the Hessian of $f_i(\theta)$).
+```{r}
+# Function to compute Hessian ------------------------------
+partial_hess <- function(theta,i){
+  h <- matrix(0,ncol = d, nrow = d)
+  h <- 1/N*tcrossprod(A[i,],A[i,])*c(exp(b[i]*(A[i,]%*%theta))/(1+exp(b[i]*(A[i,]%*%theta)))^2) 
+  diag(h) <- diag(h)+1/N*2*lambda
+  h[is.nan(h)] <- 0
+  return(h)
+}
+# test
+partial_hess(rep(3,d),1)[1:2,1:2]
+# matrice d*d
+
+
+# complete Hessian
+hess <- function(theta){
+  h <- sapply(1:N,function(i) partial_hess(theta,i))
+  sum_hesss <- matrix(rowSums(h), ncol = d, nrow = d)
+  return(sum_hesss)
+}
+
+
+# SVRG2 algorithm -----------------------------------------------------------------
+SVRG2_algo <- function(theta_0, gamma, max_iter = 20, seed = 123){
+  # Initialization
+  t1 <- Sys.time()
+  theta_k <- theta_0
+  theta_tilde <- theta_k
+  cost_hist <- vector("list", max_iter+1)
+  cost_hist[[1]] <- loss(theta_0)/loss(theta_0)
+  grad_0 <- grad(theta_0)
+  grad_hist <- vector("list", max_iter+1)
+  grad_hist[[1]] <- norm(grad_0, type = 'F')
+  grad_avg <- grad_0 # average means average over N samples (total grad)
+  hess_avg <- hess(theta_tilde)
+  # main loop
+  set.seed(seed)
+  for (i in 1:(N*max_iter)){
+    # keep grad history every epoch and compute grad of theta_tilde updated
+    if (i%%N == 0){ # remainder in euclidean division of iteration by number of samples
+      print(i%/%N)
+      theta_tilde <- theta_k
+      grad_avg <- grad(theta_tilde) # calculate gradient for theta_tilde
+      hess_avg <- hess(theta_tilde)
+      
+      grad_hist[[i%/%N+1]] <- norm(grad_avg, type = "F")
+      cost_hist[[i%/%N+1]] <- loss(theta_tilde)/loss(theta_0)
+      
+    }
+    # pick random sample uniformly on [1,N]
+    idx <- sample(1:N,1)
+    current_grad <- partial_grad(theta_k,idx)
+    prev_grad <- partial_grad(theta_tilde, idx)
+    current_hess <- partial_hess(theta_tilde,idx)
+    svrg_update <- current_grad - prev_grad + grad_avg -
+      current_hess%*%(theta_k - theta_tilde) + hess_avg%*%(theta_k - theta_tilde)
+    theta_k <- theta_k - gamma*svrg_update
+  }
+  t2 <- Sys.time()
+  comput_time <- t2 - t1
+  return(list(theta_K = theta_k, cost_hist = cost_hist, 
+              grad_hist = grad_hist, comput_time = comput_time))
+}
+```
+
+As explained in the paper, the Hessian for high-dimensional problems is too big to be used in the computation. Hence, we need approximations : the secant diagonal approximation and the diagonal ones are defined below. 
+```{r}
+# Approximation for the Hessian --------------------------------------
+
+# Approximation de la Hessienne diagonale s?cante
+partial_approx_Hessian_diag <- function(theta_t, theta_tilde,i, sigma_2 = 0.1){
+  denom <- hadamard.prod(theta_t - theta_tilde, theta_t - theta_tilde) + sigma_2
+  current_partial_grad_i <- partial_grad(theta_t,i)
+  epoch_partial_grad <- partial_grad(theta_tilde,i)
+  diagonal <- diag(partial_hess(theta_tilde,i))
+  num <- hadamard.prod(theta_t - theta_tilde, current_partial_grad_i - epoch_partial_grad) +
+    sigma_2*diagonal
+  approx_hess <- diag(as.vector(num/denom), nrow = d,ncol = d)
+  return(approx_hess)
+}
+# Les auteurs prennent sgma_2 = 0.1 dans toutes leur simulation (sauf calcul de
+# sensibilit? ? sigma_2)
+
+# Approximation par la diagonale de la Hessienne
+partial_approx_Hessian_simplediag <- function(theta_t,theta_tilde,i, sigma_2 = 0.1){
+  diagonal <-diag(partial_hess(theta_tilde,i))
+  diagonal <-diag(diagonal, nrow = d, ncol = d)
+  return(diagonal)
+}
+
+```
+
+```{r}
+deuxD_algo <- function(theta_0, approx_partial_hess, gamma, max_iter = 20, seed = 123){
+  # Initialization
+  t1 <- Sys.time()
+  theta_k <- theta_0
+  theta_tilde <- theta_k
+  cost_hist <- vector("list", max_iter +1)
+  cost_hist[[1]] <- loss(theta_0)/loss(theta_0)
+  grad_0 <- grad(theta_0)
+  grad_hist <- vector("list", max_iter +1)
+  grad_hist[[1]] <- norm(grad_0, type = 'F')
+  grad_avg <- grad_0 # average means average over N samples (total grad)
+  
+  # Define the Hessian on theta_tilde
+  sum_hess <- sapply(1:N,function(i) approx_partial_hess(theta_k,theta_tilde,i))
+  hess_avg <- matrix(rowSums(sum_hess), ncol = d, nrow = d)
+  
+  # main loop
+  set.seed(seed)
+  for (i in 1:(N*max_iter)){
+    # keep grad history every epoch and compute grad of theta_tilde updated
+    if (i%%N == 0){ # remainder in euclidean division of iteration by number of samples
+      print(i%/%N)
+      theta_tilde <- theta_k
+      grad_avg <- grad(theta_tilde) # calculate gradient for theta_tilde
+      sum_hess <- sapply(1:N,function(i) approx_partial_hess(theta_k,theta_tilde,i))
+      hess_avg <- matrix(rowSums(sum_hess), ncol = d, nrow = d)
+      grad_hist[[i%/%N+1]] <- norm(grad_avg, type = "F")
+      cost_hist[[i%/%N+1]] <- loss(theta_tilde)/loss(theta_0)
+      
+    }
+    # pick random sample uniformly on [1,N]
+    idx <- sample(1:N,1)
+    current_grad <- partial_grad(theta_k,idx)
+    prev_grad <- partial_grad(theta_tilde, idx)
+    current_hess <- approx_partial_hess(theta_k,theta_tilde,idx)
+    svrg_update <- current_grad - prev_grad + grad_avg -
+      current_hess%*%(theta_k - theta_tilde) + hess_avg%*%(theta_k - theta_tilde)
+    theta_k <- theta_k - gamma*svrg_update
+  }
+  t2 <- Sys.time()
+  comput_time <- t2 - t1
+  return(list(theta_K = theta_k, cost_hist = cost_hist, 
+              grad_hist = grad_hist, comput_time = comput_time))
+}
+```
+
+Then we define the approximation of the Hessian by curvature matching. To do so, we need a function that generates a S matrix according to the CMgauss and the CMprev algorithms. The first one is simply a  draw of $d\times k$ Gaussians.   
+```{r}
+
+# Approximation de la Hessienne par curvature matching
+
+generate_Smatrix_gauss <- function(k){
+  S <- matrix(rnorm(d*k),nrow = d, ncol = k)
+  return(S)
+}
+# test
+set.seed(34)
+head(generate_Smatrix_gauss(1))
+
+generate_Smatrix_prev <- function(S,N,delta){
+    new_col <- 1/N*delta
+    
+    S <- cbind(S,new_col)
+    return(S)
+}
+# Les colonnes de S sont les moyennes des pas pendant une ?poch (un datapass)
+
+
+# We write this function in order to use it in the Curvature Matching algorithm (CM)
+calculate_actionmatrix <- function(S,theta_tilde){
+  # Take the list of the partial Hessians H_i*S
+  # Sum those partial Hessians times S
+  B <- lapply(1:N, function(i) partial_hess(theta_tilde,i)%*%S)
+  Act <- Reduce('+',B)
+  return(1/N*Act) # Return this sum divided by N
+}
+# partial_hess(theta_tilde) size d*d
+# S size d*k, action matrix has size d*k
+set.seed(34)
+calculate_actionmatrix(generate_Smatrix_gauss(3),rep(2,d))[1:3,1:3] 
+#with a d*3 S matrix, you get a d*3 action matrix
+
+SVRG2_curvmatch_gauss_algo  <- function(theta_0, gamma, S, max_iter = 20, seed = 123){
+  # Initialization
+  t1 <- Sys.time()
+  theta_k <- theta_0
+  theta_tilde <- theta_k
+  cost_hist <- vector("list",max_iter+1)
+  cost_hist[[1]] <- loss(theta_0)/loss(theta_0)
+  grad_0 <- grad(theta_0)
+  grad_hist <- vector("list",max_iter+1)
+  grad_hist[[1]] <- norm(grad_0, type = 'F') # norme de Frobenius
+  grad_avg <- grad_0 # average means average over N samples (total grad)
+  Act <- calculate_actionmatrix(S,theta_tilde)
+  # size d * k
+  C <- expm::sqrtm(pracma::pinv(crossprod(S,Act)))
+  # ici C : size kxk
+  S_tilde <- S%*%C # size d*k
+  #normalize Hessian action
+  A_tilde <- Act%*%C # size d*k
+  
+  # main loop
+  set.seed(seed)
+  for (i in 1:(N*max_iter)){
+    # keep grad history every epoch and compute grad of theta_tilde updated
+    if (i%%N == 0){ # rest in euclidean division of iteration by number of samples
+      print(i%/%N)
+      theta_tilde <- theta_k
+      grad_avg <- grad(theta_tilde) # calculate gradient for theta_tilde
+      
+      S <- generate_Smatrix_gauss(i%/%N) # generate S in R^(dxk)
+      # this is a new S matrix (bigger)
+      Act <- calculate_actionmatrix(S,theta_tilde)
+      D <- crossprod(S,Act)
+      D[is.infinite(D)] <- 0
+      C <- Re(expm::sqrtm(pracma::pinv(D)))
+      
+      # Returns the square rooth of the matrix pseudo inverse of t(S)*Act
+      
+      S_tilde <- S%*%C
+      A_tilde <- Act%*%C # normalize Hessian action
+      
+      grad_hist[[i%/%N+1]] <- norm(grad_avg, type = "F") 
+      cost_hist[[i%/%N+1]]  <- loss(theta_tilde)/loss(theta_0)
+
+    }
+    # pick random sample uniformly on [1,N]
+    idx <- sample(1:N,1)
+    current_grad <- partial_grad(theta_k,idx)
+    prev_grad <- partial_grad(theta_tilde, idx)
+    current_hess <- partial_hess(theta_tilde,idx)
+    # calculate dt
+    M <- A_tilde%*%crossprod(S_tilde,current_hess)%*%tcrossprod(S_tilde,(A_tilde))
+    dk <- current_grad - prev_grad + grad_avg -
+      M%*%(theta_k - theta_tilde) + tcrossprod(A_tilde,A_tilde)%*%(theta_k - theta_tilde)
+    
+    # update theta
+    theta_k <- theta_k - gamma*dk
+  }
+  t2 <- Sys.time()
+  comput_time <- t2 - t1
+  return(list(theta_K = theta_k, cost_hist = cost_hist,
+              grad_hist = grad_hist, comput_time = comput_time))
+}
+
+# CM algorithm using prev ------------------------------------------------------
+SVRG2_curvmatch_prev_algo  <- function(theta_0, gamma, S, max_iter = 20, seed = 123){
+  # Initialization
+  t1 <- Sys.time()
+  theta_k <- theta_0
+  theta_tilde <- theta_k
+  cost_hist <- vector("list",max_iter+1)
+  cost_hist[[1]] <- loss(theta_0)/loss(theta_0)
+  grad_0 <- grad(theta_0)
+  grad_hist <- norm(grad_0, type = 'F') # norme de Frobenius
+  grad_avg <- grad_0 # average means average over N samples (total grad)
+  Act <- calculate_actionmatrix(S,theta_tilde)
+  # size d * k
+  C <- expm::sqrtm(pracma::pinv(crossprod(S,Act)))
+  # ici C : size kxk
+  
+  S_tilde <- S%*%C # size d*k
+  #normalize Hessian action
+  A_tilde <- Act%*%C # size d*k
+  steps <- rep(0,d)
+  # main loop
+  set.seed(seed)
+  for (i in 1:(N*max_iter)){
+    # keep grad history every epoch and compute grad of theta_tilde updated
+    if (i%%N == 0){ # rest in euclidean division of iteration by number of samples
+      print(i%/%N)
+      theta_tilde <- theta_k
+      grad_avg <- grad(theta_tilde) # calculate gradient for theta_tilde
+      delta <- steps
+      steps <- rep(0,d)
+      S <- generate_Smatrix_prev(S,N,delta) # generate S in R^(dxk)
+      # this is a new S matrix (bigger)
+      Act <- calculate_actionmatrix(S,theta_tilde)
+      
+      C <- Re(expm::sqrtm(pracma::pinv(crossprod(S,Act))))
+      
+      S_tilde <- S%*%C
+      A_tilde <- Act%*%C # normalize Hessian action
+      
+      grad_hist[[i%/%N+1]] <- norm(grad_avg, type = "F") 
+      cost_hist[[i%/%N+1]] <- loss(theta_tilde)/loss(theta_0)
+    }
+    # pick random sample uniformly on [1,N]
+    idx <- sample(1:N,1)
+    current_grad <- partial_grad(theta_k,idx)
+    prev_grad <- partial_grad(theta_tilde, idx)
+    current_hess <- partial_hess(theta_tilde,idx)
+    # calculate dt
+    M <- A_tilde%*%crossprod(S_tilde,current_hess)%*%(tcrossprod(S_tilde,(A_tilde)))
+    dk <- current_grad - prev_grad + grad_avg -
+      M%*%(theta_k - theta_tilde) + tcrossprod(A_tilde)%*%(theta_k - theta_tilde)
+    # update theta
+    theta_k <- theta_k - gamma*dk
+    steps <- rowSums(cbind(steps, dk))
+  }
+  t2 <- Sys.time()
+  comput_time <- t2 - t1
+  return(list(theta_K = theta_k, cost_hist = cost_hist,
+              grad_hist = grad_hist, comput_time = comput_time))
+}
+
+# Action matching algorithm -----------------------------------------------
+SVRG2_actionmatch_gauss_algo  <- function(theta_0, gamma, S, max_iter = 20, seed = 123){
+  # Initialization
+  t1 <- Sys.time()
+  theta_k <- theta_0
+  theta_tilde <- theta_k
+  cost_hist <- vector("list",max_iter+1)
+  cost_hist[[1]] <- loss(theta_0)/loss(theta_0)
+  grad_hist <- vector("list",max_iter+1)
+  grad_0 <- grad(theta_0)
+  grad_hist[[1]] <- norm(grad_0, type = 'F') # norme de Frobenius
+  grad_avg <- grad_0 # average means average over N samples (total grad)
+  Act <- calculate_actionmatrix(S,theta_tilde)
+  # size d * k
+  C <- expm::sqrtm(pracma::pinv(crossprod(S,Act)))
+  # ici C : size kxk
+  
+  S_tilde <- S%*%C # size d*k
+  #normalize Hessian action
+  A_tilde <- Act%*%C # size d*k
+  
+  # main loop
+  set.seed(seed)
+  for (i in 1:(N*max_iter)){
+    # keep grad history every epoch and compute grad of theta_tilde updated
+    if (i%%N == 0){ # rest in euclidean division of iteration by number of samples
+      print(i%/%N)
+      theta_tilde <- theta_k
+      grad_avg <- grad(theta_tilde) # calculate gradient for theta_tilde
+      
+      S <- generate_Smatrix_gauss(i/N) # generate S in R^(dxk)
+      # this is a new S matrix (bigger)
+      Act <- calculate_actionmatrix(S,theta_tilde)
+      C <- Re(expm::sqrtm(pracma::pinv(crossprod(S,Act))))
+      
+      S_tilde <- S%*%C
+      A_tilde <- Act%*%C # normalize Hessian action
+      
+      grad_hist[[i%/%N+1]] <- norm(grad(theta_tilde), type = "F") 
+      cost_hist[[i%/%N+1]] <- loss(theta_tilde)/loss(theta_0)
+   }
+    # pick random sample uniformly on [1,N]
+    idx <- sample(1:N,1)
+    current_grad <- partial_grad(theta_k,idx)
+    prev_grad <- partial_grad(theta_tilde, idx)
+    current_hess <- partial_hess(theta_tilde,idx)
+    # calculate dt
+    M <- tcrossprod(A_tilde,S_tilde)%*%current_hess%*%(diag(rep(1,d))-tcrossprod(S_tilde,A_tilde))+
+      current_hess%*%(tcrossprod(S_tilde,A_tilde))
+    
+    dk <- current_grad - prev_grad + grad_avg -
+      M%*%(theta_k - theta_tilde) + tcrossprod(A_tilde)%*%(theta_k - theta_tilde)
+    # update theta
+    theta_k <- theta_k - gamma*dk
+  }
+  t2 <- Sys.time()
+  comput_time <- t2 - t1
+  return(list(theta_K = theta_k, cost_hist = cost_hist,
+              grad_hist = grad_hist,  comput_time = comput_time))
+}
+
+# Action matching using prev S -------------------------------------------------------
+SVRG2_actionmatch_prev_algo  <- function(theta_0, gamma, S, max_iter = 20, seed = 123){
+  # Initialization
+  t1 <- Sys.time()
+  theta_k <- theta_0
+  theta_tilde <- theta_k
+  cost_hist <- vector("list",max_iter+1)
+  cost_hist[[1]] <- loss(theta_0)/loss(theta_0)
+  grad_hist <- vector("list",max_iter+1)
+  grad_0 <- grad(theta_0)
+  grad_hist[[1]] <- norm(grad_0, type = 'F') # norme de Frobenius
+
+  grad_avg <- grad_0 # average means average over N samples (total grad)
+  Act <- calculate_actionmatrix(S,theta_tilde)
+  # size d * k
+  C <- expm::sqrtm(pracma::pinv(crossprod(S,Act)))
+  # ici C : size kxk
+  
+  S_tilde <- S%*%C # size d*k
+  #normalize Hessian action
+  A_tilde <- Act%*%C # size d*k
+  steps <- rep(0,d)
+  # main loop
+  set.seed(seed)
+  for (i in 1:(N*max_iter)){
+    # keep grad history every epoch and compute grad of theta_tilde updated
+    if (i%%N == 0){ # rest in euclidean division of iteration by number of samples
+      print(i%/%N)
+      theta_tilde <- theta_k
+      grad_avg <- grad(theta_tilde) # calculate gradient for theta_tilde
+      
+      # Le delta sont les derni?res N colonnes de steps
+      delta <- steps
+      steps <- rep(0,d)
+      S <- generate_Smatrix_prev(S,N,delta) # generate S in R^(dxk)
+      # this is a new S matrix (bigger)
+      Act <- calculate_actionmatrix(S,theta_tilde)
+      C <- Re(expm::sqrtm(pracma::pinv(crossprod(S,Act))))
+      
+      S_tilde <- S%*%C
+      A_tilde <- Act%*%C # normalize Hessian action
+      
+      grad_hist[[i%/%N+1]] <- norm(grad(theta_tilde), type = "F")
+      cost_hist[[i%/%N+1]] <- loss(theta_tilde)/loss(theta_0)
+    }
+    # pick random sample uniformly on [1,N]
+    idx <- sample(1:N,1)
+    current_grad <- partial_grad(theta_k,idx)
+    prev_grad <- partial_grad(theta_tilde, idx)
+    current_hess <- partial_hess(theta_tilde,idx)
+    # calculate dt
+    M <- tcrossprod(A_tilde,S_tilde)%*%current_hess%*%(diag(rep(1,d))-tcrossprod(S_tilde,A_tilde))+
+      current_hess%*%(tcrossprod(S_tilde,A_tilde))
+    
+    dk <- current_grad - prev_grad + grad_avg -
+      M%*%(theta_k - theta_tilde) + tcrossprod(A_tilde)%*%(theta_k - theta_tilde)
+    # On garde les pas en m?moires pour former S
+    steps <- rowSums(cbind(steps,dk))
+    
+    # update theta
+    theta_k <- theta_k - gamma*dk
+  }
+  t2 <- Sys.time()
+  comput_time <- t2 - t1
+  return(list(theta_K = theta_k, cost_hist = cost_hist, 
+              grad_hist = grad_hist, comput_time = comput_time))
+}
+```
+
+In the following code, we define the function `compute_algorithms` that takes a dataset (from the LIBSVM database) and runs the various algorithms. The function `define_parameters`defines the parameters to be taken into account when applying the algorithms. We use the mushrooms and the phishing datasets. Then, we compare on the two graphs for each dataset the norm of the gradient at each epoch for all methods on the one hand and on the other hand the loss history of each method (defined as $loss(\theta_k)/loss(\theta_0)$) at each epoch. An epoch is defined as one datapass (one loop through all the data). In all the code, we do $15$ datapasses in each dataset (which is what is done in the article depending on the dataset -sometimes they take less). For each dataset, we print the output $\theta$ of each algorithm in order to compare how they differ and the computation time for the various methods. 
+```{r, warning = FALSE}
+define_parameters <- function(filename){
+  
+  print(filename)
+  data <- read.matrix.csr(file = filename)
+  y <- data[["y"]]
+  x <- data[["x"]]
+  
+  x <- as.matrix(x)
+  y <- as.numeric(y)
+  
+  b <- as.numeric(y)
+  A <- x
+  N <- length(b)
+  d <- ncol(A)
+  A <- matrix(A, nrow = N, ncol = d)
+
+  max_iter <- 15 #datapasses
+  norm_x <- apply(A,1, function(i) norm(as.matrix(i),type = "F"))
+  # Regularization parameter chosen in all experiments
+  lambda <- max(norm_x)/(4*N)
+  L <-   max(norm_x) + lambda
+  theta_0 <- rep(0,d)
+  return(list(A = A, b = b, N = N, d =d, max_iter = max_iter, lambda = lambda,
+              L = L, theta_0 = theta_0, norm_x = norm_x))
+}
+compute_algorithms <- function(a = c(5,1,2,3,3)){
+  t1 <- Sys.time()
+  gamma_svrg <- 2^(-a[1])/L
+  print("svrg")
+  svrg <- SVRG_algo(theta_0, gamma_svrg, max_iter)
+  
+  dataset <- data.frame("n_epoch" = 1:(max_iter+1),
+                        "grad_hist_SVRG" = unlist(svrg[["grad_hist"]]),
+                        "cost_hist_SVRG" = unlist(svrg[["cost_hist"]]))
+  print("svrg2")
+  gamma_svrg2 <- 2^(-a[2])/L
+  svrg2 <- SVRG2_algo(theta_0, gamma_svrg2, max_iter)
+  dataset <- data.frame(dataset, "grad_hist_SVRG2" = unlist(svrg2[["grad_hist"]]),
+                        "cost_hist_SVRG2" = unlist(svrg2[["cost_hist"]]))
+  print("2D")
+  gamma_2D <- 2^(-a[3])/L
+  deuxD <- deuxD_algo(theta_0,approx_partial_hess = partial_approx_Hessian_simplediag,  
+                      gamma_2D, max_iter)
+  print("2Dsec")
+  deuxDsec <- deuxD_algo(theta_0,approx_partial_hess = partial_approx_Hessian_diag,  
+                         gamma_2D, max_iter)
+  dataset <- data.frame(dataset, "grad_hist_2D" = unlist(deuxD[["grad_hist"]]),
+                        "cost_hist_2D" = unlist(deuxD[["cost_hist"]]),
+                        "grad_hist_2Dsec" = unlist(deuxDsec[["grad_hist"]]),
+                        "cost_hist_2Dsec" = unlist(deuxDsec[["cost_hist"]]))
+  print("CMgauss")
+  gamma_cm <- 2^(-a[4])/L
+  CMgauss <- SVRG2_curvmatch_gauss_algo(theta_0, gamma_cm, 
+             generate_Smatrix_gauss(1),max_iter)
+
+  dataset <- data.frame(dataset, "grad_hist_CMgauss" = unlist(CMgauss[["grad_hist"]]),
+                        "cost_hist_CMgauss" = unlist(CMgauss[["cost_hist"]]))
+  print("CMprev")
+  CMprev <- SVRG2_curvmatch_prev_algo(theta_0, gamma_cm, generate_Smatrix_gauss(1),max_iter)
+  
+  dataset <- data.frame(dataset, "grad_hist_CMprev" = unlist(CMprev[["grad_hist"]]),
+                        "cost_hist_CMprev" = unlist(CMprev[["cost_hist"]]))
+  
+  print("AMgauss")
+  gamma_am <- 2^(-a[5])/L
+  AMgauss <- SVRG2_actionmatch_gauss_algo(theta_0, gamma_am, generate_Smatrix_gauss(1),max_iter)
+  dataset <- data.frame(dataset, "grad_hist_AMgauss" = unlist(AMgauss[["grad_hist"]]),
+                        "cost_hist_AMgauss" = unlist(AMgauss[["cost_hist"]]))
+  print("AMprev")
+  AMprev <- SVRG2_actionmatch_prev_algo(theta_0, gamma_am, generate_Smatrix_gauss(1),max_iter)
+  
+  dataset <- data.frame(dataset, "grad_hist_AMprev" = unlist(AMprev[["grad_hist"]]),
+                        "cost_hist_AMprev" = unlist(AMprev[["cost_hist"]]))
+  sizegr <- 0.8
+  g1 <- ggplot(data= dataset)+
+    geom_line( mapping = aes(x = n_epoch, y = grad_hist_SVRG, colour = "SVRG", lty = "SVRG"),
+               size = sizegr, alpha = 0.8)+theme_bw()+
+    geom_line( mapping = aes(x = n_epoch, y = grad_hist_SVRG2 , colour = "SVRG2", lty = "SVRG2"), 
+               size =sizegr, alpha = 0.8)+
+    geom_line( mapping = aes(x = n_epoch, y = grad_hist_CMgauss, colour = "CMgauss", lty = "CMgauss"), 
+               size = sizegr, alpha = 0.8)+
+    geom_line( mapping = aes(x = n_epoch, y = grad_hist_CMprev, colour = "CMprev", lty = "CMprev"),
+               size = sizegr, alpha = 0.8)+
+    geom_line( mapping = aes(x = n_epoch, y = grad_hist_AMgauss, colour = "AMgauss", lty = "AMgauss"),
+               size = sizegr, alpha = 0.8)+
+    geom_line( mapping = aes(x = n_epoch, y = grad_hist_AMprev, colour = "AMprev", lty = "AMprev"), 
+               size = sizegr, alpha = 0.8)+
+    geom_line( mapping = aes(x = n_epoch, y = grad_hist_2D, colour = "2D", lty = "2D"),
+               size = 0.5, alpha = 0.8)+
+    geom_line( mapping = aes(x = n_epoch, y = grad_hist_2Dsec, colour = "2Dsec", lty = "2Dsec"), 
+               size = sizegr, alpha = 0.8)+
+    ggtitle("Norm of gradient history of all methods")+
+    labs(x = "N epoch. Log scale")+
+    theme(text=element_text(size=12),
+          plot.title = element_text(hjust = 0.5, face = "bold"),
+          plot.subtitle = element_text(hjust = 0.5),
+          plot.caption = element_text(face ="italic"),
+          legend.position = "right")+coord_trans(y = "log")
+  
+  g2 <- ggplot(data= dataset)+
+    geom_line( mapping = aes(x = n_epoch, y = cost_hist_SVRG, colour = "SVRG", lty = "SVRG"),
+               size = sizegr, alpha = 0.8)+theme_bw()+
+    geom_line( mapping = aes(x = n_epoch, y = cost_hist_SVRG2 , colour = "SVRG2", lty = "SVRG2"), 
+               size = sizegr, alpha = 0.8)+
+    geom_line( mapping = aes(x = n_epoch, y = cost_hist_CMgauss, colour = "CMgauss", lty = "CMgauss"), 
+               size = sizegr, alpha = 0.8)+
+    geom_line( mapping = aes(x = n_epoch, y = cost_hist_CMprev, colour = "CMprev", lty = "CMprev"),
+               size = sizegr, alpha = 0.8)+
+    geom_line( mapping = aes(x = n_epoch, y = cost_hist_AMgauss, colour = "AMgauss", lty = "AMgauss"),
+               size = sizegr, alpha = 0.8)+
+    geom_line( mapping = aes(x = n_epoch, y = cost_hist_AMprev, colour = "AMprev", lty = "AMprev"), 
+               size = sizegr, alpha = 0.8)+
+    geom_line( mapping = aes(x = n_epoch, y = cost_hist_2D, colour = "2D", lty = "2D"),
+               size = sizegr, alpha = 0.8)+
+    geom_line( mapping = aes(x = n_epoch, y = cost_hist_2Dsec, colour = "2Dsec", lty = "2Dsec"), 
+               size = sizegr, alpha = 0.8)+
+    ggtitle("Loss history of all methods")+
+    labs(x = "N epoch. Log scale")+
+    theme(text=element_text(size=12),
+          plot.title = element_text(hjust = 0.5, face = "bold"),
+          plot.subtitle = element_text(hjust = 0.5),
+          plot.caption = element_text(face ="italic"),
+          legend.position = "right")+coord_trans(y = "log")
+  data_theta <- data.frame("SVRG_theta" = svrg$theta_K,
+                           "SVRG2_theta" = svrg2$theta_K,
+                           "2D_theta" = deuxD$theta_K,
+                           "2Dsec_theta" = deuxDsec$theta_K,
+                           "CMgauss_theta" = CMgauss$theta_K,
+                           "CMprev_theta" = CMprev$theta_K,
+                           "AMgauss_theta" = AMgauss$theta_K,
+                           "AMprev_theta" = AMprev$theta_K)
+  t2 <- Sys.time()
+  total_time <- t2 - t1
+  data_time <- data.frame("total_t" = total_time,
+                          "SVRG_t" = svrg$comput_time,
+                          "SVRG2_t" = svrg2$comput_time,
+                          "2D_t" = deuxD$comput_time,
+                          "2Dsec_t" = deuxDsec$comput_time,
+                          "CMgauss_t" = CMgauss$comput_time,
+                          "CMprev_t" = CMprev$comput_time,
+                          "AMgauss_t" = AMgauss$comput_time,
+                          "AMprev_t" = AMprev$comput_time)
+  return(list(g1 = g1, g2 = g2, dataset = dataset, 
+              data_theta = data_theta, data_time = data_time))
+  
+}
+```
+
+```{r, eval = FALSE, results = 'hide',warning  = FALSE,message = FALSE}
+# Application to mushrooms
+param <- define_parameters("mushrooms.txt")
+A <- param$A
+b <- param$b
+d <- param$d
+N <- param$N
+theta_0 <- param$theta_0
+norm_x <- param$norm_x
+L <- param$L
+lambda <- param$lambda
+max_iter <- param$max_iter
+set.seed(78)
+theta_0 <- runif(d)
+results <- compute_algorithms(a = c(5,0,3,4,4))
+
+```
+```{r, echo = FALSE}
+load("results_mushrooms4.RData")
+```
+
+```{r}
+results$g1
+results$g2
+results_comput_time <- xtable(results$data_time)
+results_theta <- xtable(results$data_theta)
+```
+
+```{r, results='asis'}
+kable(results_comput_time, "html") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = F,font_size = 12)
+kable(results_theta, "html") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = F,font_size = 12)
+```
+```{r, eval = FALSE,warning  = FALSE, message = FALSE, results = 'hide'}
+# Application to phishing
+param <- define_parameters("phishing.txt")
+A <- param$A
+b <- param$b
+d <- param$d
+N <- param$N
+norm_x <- param$norm_x
+L <- param$L
+lambda <- param$lambda
+max_iter <- param$max_iter
+set.seed(78)
+theta_0 <- runif(d)
+results <- compute_algorithms(a = c(5,-1,1,4,4))
+```
+```{r, echo = FALSE}
+load("results_phishing2.RData")
+```
+
+
+```{r}
+results$g1
+results$g2
+results_comput_time <- xtable(results$data_time)
+results_theta <- xtable(results$data_theta)
+```
+
+```{r, results='asis'}
+kable(results_comput_time, "html") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = F,font_size = 12)
+kable(results_theta, "html") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = F,font_size = 12)
+```
+### Sensitivity to initial value
+
+In this subsection, we look at the results on one dataset, mushrooms with different starting values:
+```{r, eval = FALSE,warning  = FALSE, message = FALSE, results = 'hide'}
+# Application to mushrooms - various initial values
+param <- define_parameters("mushrooms.txt")
+A <- param$A
+b <- param$b
+d <- param$d
+N <- param$N
+norm_x <- param$norm_x
+L <- param$L
+lambda <- param$lambda
+max_iter <- param$max_iter
+set.seed(134)
+theta_0 <- runif(d)
+results1 <- compute_algorithms(a= c(5,0,3,4,4))
+set.seed(64)
+theta_0 <- runif(d)
+results2 <- compute_algorithms(a =c(5,0,3,4,4))
+```
+```{r, echo = FALSE}
+load("results2_mushrooms_varinit1.RData")
+
+load("results2_mushrooms_varinit2.RData")
+```
+
+
+```{r}
+results1$g1
+results2$g1
+results1$g2
+results2$g2
+results_comput_time1 <- xtable(results1$data_time)
+results_comput_time2 <- xtable(results2$data_time)
+results_theta1 <- xtable(results1$data_theta)
+results_theta2 <- xtable(results2$data_theta)
+```
+
+```{r, results='asis'}
+kable(results_comput_time1, "html") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = F,font_size = 12)
+kable(results_comput_time2, "html") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = F,font_size = 12)
+kable(results_theta1, "html") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = F,font_size = 12)
+kable(results_theta2, "html") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = F,font_size = 12)
+```
+### Sensitivity to choice of $\sigma^2$
+
+```{r, eval = FALSE}
+deuxDsec_algo <- function(theta_0, approx_partial_hess, gamma,sigma2, max_iter = 20, seed = 123){
+  # Initialization
+  t1 <- Sys.time()
+  theta_k <- theta_0
+  theta_tilde <- theta_k
+  cost_hist <- vector("list", max_iter +1)
+  cost_hist[[1]] <- loss(theta_0)/loss(theta_0)
+  grad_0 <- grad(theta_0)
+  grad_hist <- vector("list", max_iter +1)
+  grad_hist[[1]] <- norm(grad_0, type = 'F')
+  grad_avg <- grad_0 # average means average over N samples (total grad)
+  
+  # Define the Hessian on theta_tilde
+  sum_hess <- sapply(1:N,function(i) approx_partial_hess(theta_k,theta_tilde,i,sigma2))
+  hess_avg <- matrix(rowSums(sum_hess), ncol = d, nrow = d)
+  
+  # main loop
+  set.seed(seed)
+  for (i in 1:(N*max_iter)){
+    # keep grad history every epoch and compute grad of theta_tilde updated
+    if (i%%N == 0){ # remainder in euclidean division of iteration by number of samples
+      print(i%/%N)
+      theta_tilde <- theta_k
+      grad_avg <- grad(theta_tilde) # calculate gradient for theta_tilde
+      sum_hess <- sapply(1:N,function(i) approx_partial_hess(theta_k,theta_tilde,i,sigma2))
+      hess_avg <- matrix(rowSums(sum_hess), ncol = d, nrow = d)
+      grad_hist[[i%/%N+1]] <- norm(grad_avg, type = "F")
+      cost_hist[[i%/%N+1]] <- loss(theta_tilde)/loss(theta_0)
+      
+    }
+    # pick random sample uniformly on [1,N]
+    idx <- sample(1:N,1)
+    current_grad <- partial_grad(theta_k,idx)
+    prev_grad <- partial_grad(theta_tilde, idx)
+    current_hess <- approx_partial_hess(theta_k,theta_tilde,idx)
+    svrg_update <- current_grad - prev_grad + grad_avg -
+      current_hess%*%(theta_k - theta_tilde) + hess_avg%*%(theta_k - theta_tilde)
+    theta_k <- theta_k - gamma*svrg_update
+  }
+  t2 <- Sys.time()
+  comput_time <- t2 - t1
+  return(list(theta_K = theta_k, cost_hist = cost_hist, 
+              grad_hist = grad_hist, comput_time = comput_time))
+}
+choice_sigma <- function(a = 1, sigma_2 = c(1,0.5,0.01)){
+  gamma_2Dsec <- 2^(-a)/L
+  
+  dataset <- data.frame("n_epoch" = 1:(max_iter+1))
+  sigma2 <- sigma_2[1]
+  deuxDsec1 <- deuxDsec_algo(theta_0,approx_partial_hess = partial_approx_Hessian_diag,  
+                         gamma_2Dsec, sigma2,max_iter)
+  sigma2 <- sigma_2[2]
+  deuxDsec2 <- deuxDsec_algo(theta_0,approx_partial_hess = partial_approx_Hessian_diag,  
+                         gamma_2Dsec, sigma2,max_iter)
+  sigma2 <- sigma_2[3]
+  deuxDsec3 <- deuxDsec_algo(theta_0,approx_partial_hess = partial_approx_Hessian_diag,  
+                         gamma_2Dsec, sigma2,max_iter)
+  dataset <- data.frame(dataset,
+    "grad_hist_2Dsec1" = unlist(deuxDsec1[["grad_hist"]]),
+    "grad_hist_2Dsec0.5" = unlist(deuxDsec2[["grad_hist"]]),
+    "grad_hist_2Dsec0.01"= unlist(deuxDsec3[["grad_hist"]]),
+    "cost_hist_2Dsec1" = unlist(deuxDsec1[["cost_hist"]]),
+    "cost_hist_2Dsec0.5" = unlist(deuxDsec2[["cost_hist"]]),
+    "cost_hist_2Dsec0.01" = unlist(deuxDsec3[["cost_hist"]]))
+    sizegr <- 0.8
+  g1 <- ggplot(data= dataset)+
+    geom_line( mapping = aes(x = n_epoch, y = grad_hist_2Dsec1, colour = "grad_hist_2Dsec1", lty = "grad_hist_2Dsec1"),
+               size = sizegr, alpha = 0.8)+theme_bw()+
+    geom_line( mapping = aes(x = n_epoch, y = grad_hist_2Dsec0.5, colour = "grad_hist_2Dsec0.5", lty = "grad_hist_2Dsec0.5"), 
+               size =sizegr, alpha = 0.8)+
+    geom_line( mapping = aes(x = n_epoch, y = grad_hist_2Dsec0.01, colour = "grad_hist_2Dsec0.01", lty = "grad_hist_2Dsec0.01"), 
+               size = sizegr, alpha = 0.8)+
+    ggtitle("Norm of gradient history of 2Dsec with different sigma2")+
+    labs(x = "N epoch. Log scale")+
+    theme(text=element_text(size=12),
+          plot.title = element_text(hjust = 0.5, face = "bold"),
+          plot.subtitle = element_text(hjust = 0.5),
+          plot.caption = element_text(face ="italic"),
+          legend.position = "right")+coord_trans(y = "log")
+  
+ g2 <- ggplot(data= dataset)+
+    geom_line( mapping = aes(x = n_epoch, y = cost_hist_2Dsec1, colour = "cost_hist_2Dsec1", lty = "2Dsec1"),
+               size = sizegr, alpha = 0.8)+theme_bw()+
+    geom_line( mapping = aes(x = n_epoch, y = cost_hist_2Dsec0.5, colour = "cost_hist_SVRG0.5", lty = "2Dsec0.5"), 
+               size =sizegr, alpha = 0.8)+
+    geom_line( mapping = aes(x = n_epoch, y = cost_hist_2Dsec0.01, colour = "cost_hist_2Dsec0.01", lty = "2Dsec0.01"), 
+               size = sizegr, alpha = 0.8)+
+    ggtitle("Loss history of 2Dsec with different sigma2")+
+    labs(x = "N epoch. Log scale")+
+    theme(text=element_text(size=12),
+          plot.title = element_text(hjust = 0.5, face = "bold"),
+          plot.subtitle = element_text(hjust = 0.5),
+          plot.caption = element_text(face ="italic"),
+          legend.position = "right")+coord_trans(y = "log")
+  
+  t2 <- Sys.time()
+  return(list(g1 = g1, g2 = g2, dataset = dataset))
+  
+}
+```
+```{r, eval = FALSE}
+# Application to phishing - 2Dsec different sigma2
+param <- define_parameters("phishing.txt")
+A <- param$A
+b <- param$b
+d <- param$d
+N <- param$N
+norm_x <- param$norm_x
+L <- param$L
+lambda <- param$lambda
+max_iter <- param$max_iter
+set.seed(78)
+theta_0 <- runif(d)
+results_sigma <- choice_sigma()
+```
+```{r, echo = FALSE}
+load("results2_sigma_phising.RData")
+```
+```{r}
+results_sigma$g1
+results_sigma$g2
+```
+
