@@ -11,10 +11,10 @@ output:
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-# Project of Stochastic Optimization and Automatic Differentiation in Machine Learning
+# Stochastic Optimization and Automatic Differentiation in Machine Learning
 
 
-In the following code we will reproduce the article of R. Gower, N. Le Roux and F. Bach on *Tracking the gradients using the Hessian:
+In the following code we will reproduce the article of **R. Gower, N. Le Roux and F. Bach** on *Tracking the gradients using the Hessian:
 A new look at variance reducing stochastic methods*. 
 
 ```{r, echo = FALSE, results='hide', message = FALSE, warning=FALSE}
@@ -71,6 +71,7 @@ First, we define the loss. As in the article, we choose the logistic loss with a
 $$
 loss(b,A\theta) =\frac{1}{N}\sum_{i=1}^N\log(1+\exp(-b_i(A\theta)_i)+\lambda||\theta||_2^2 
 $$
+
 ```{r}
 # logistic loss
 # Definition of the loss F(theta) in the article
@@ -94,6 +95,7 @@ F(\theta) = loss(y,A\theta)\\
 f_i(\theta) = \log(1+\exp(-b_i(A\theta)_i)+\lambda||\theta||_2^2 
 $$
 Note that if you sum the partial losses by rows and divide by $N$, you get the total loss.
+
 ```{r}
 partial_loss <- function(theta,i){
   l <- 1/N*(log(1+ exp(-b[i]*(A[i,]%*%theta)))) + 1/N*lambda*norm(as.matrix(theta), type = "F")  # loss of the ith argument
@@ -235,7 +237,8 @@ SVRG2_algo <- function(theta_0, gamma, max_iter = 20, seed = 123){
 }
 ```
 
-As explained in the paper, the Hessian for high-dimensional problems is too big to be used in the computation. Hence, we need approximations : the secant diagonal approximation and the diagonal ones are defined below. 
+As explained in the paper, the **Hessian for high-dimensional problems is too big to be used in the computation**. Hence, we need approximations : the secant diagonal approximation and the diagonal ones are defined below. 
+
 ```{r}
 # Approximation for the Hessian --------------------------------------
 
@@ -309,7 +312,8 @@ deuxD_algo <- function(theta_0, approx_partial_hess, gamma, max_iter = 20, seed 
 }
 ```
 
-Then we define the approximation of the Hessian by curvature matching. To do so, we need a function that generates a S matrix according to the CMgauss and the CMprev algorithms. The first one is simply a  draw of $d\times k$ Gaussians.   
+Then we define the approximation of the Hessian by **curvature matching**. To do so, we need a function that generates a S matrix according to the CMgauss and the CMprev algorithms. The first one is simply a  draw of $d\times k$ Gaussians.   
+
 ```{r}
 
 # Approximation de la Hessienne par curvature matching
